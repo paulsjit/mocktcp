@@ -1,0 +1,38 @@
+config MTCP
+    bool "Support MockTCP Library"
+    default n
+
+config MTCP_ENABLE_SYNC
+    bool "Enable synchronization with host at startup"
+    default y
+    depends on MTCP
+
+config MTCP_NUM_RX_HEADERS
+    int "Number of Recieve Headers"
+    default 512
+    depends on MTCP
+
+config MTCP_NUM_TX_HEADERS
+    int "Number of Transmit Headers"
+    default 512
+    depends on MTCP
+
+config MTCP_NUM_RX_REQUESTS
+    int "Number of Recieve Requests"
+    default 512
+    depends on MTCP
+
+config MTCP_NUM_TX_REQUESTS
+    int "Number of Transmit Requests"
+    default 512
+    depends on MTCP
+
+config MTCP_LOG
+    bool "Support Logging in MockTCP Library"
+    default n
+    depends on MTCP
+
+config MTCP_STATS
+    bool "Support stats collection in MockTCP Library"
+    default n
+    depends on MTCP
