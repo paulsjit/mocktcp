@@ -126,7 +126,7 @@ int mtcp_wrapper::queue_read(uint32_t id) {
     auto r = std::make_unique<req_wrapper>(mtcp_submit_request(id, REQ_TYPE_READ, NULL, 0, false));
     int wid = mtcp_req_get_wait_id(r->r);
     auto ret = eventmap.insert({wid, std::move(r)}); 
-    if(ret.second)
+    if(!ret.second)
         throw std::runtime_error(std::string(Format("%s: error inserting wid = %d in eventmap", __PRETTY_FUNCTION__, wid).buf));
     return ret.first->first;
 }
@@ -137,7 +137,7 @@ int mtcp_wrapper::queue_write(uint32_t id, uint8_t *buffer, uint32_t sz) {
     auto r = std::make_unique<req_wrapper>(mtcp_submit_request(id, REQ_TYPE_WRITE, buffer, sz, false));
     int wid = mtcp_req_get_wait_id(r->r);
     auto ret = eventmap.insert({wid, std::move(r)});
-    if(ret.second)
+    if(!ret.second)
         throw std::runtime_error(std::string(Format("%s: error inserting wid = %d in eventmap", __PRETTY_FUNCTION__, wid).buf));
     return ret.first->first;
 }
@@ -146,6 +146,8 @@ std::unique_ptr<req_wrapper> mtcp_wrapper::wait_event_one(std::vector<int> wait_
     std::for_each(wait_ids.begin(), wait_ids.end(), [this](int &n){ if(eventmap.find(n) == eventmap.end()) throw std::runtime_error(std::string(Format("%s: event ids %s is not registered", __PRETTY_FUNCTION__, n).buf)); });
 
     auto eid = mtcp_wait_for_any_completion(wait_ids.data(), wait_ids.size(), NULL);
+    if(eid < 0)
+        return nullptr;
     return std::move(mtcp_wrapper::eventmap.extract(eid).mapped());
 }
 
@@ -163,12 +165,17 @@ PYBIND11_MODULE(mocktcp_lib, m) {
     mocktcp_lib.def("queue_read", [](mtcp_wrapper &s, uint32_t id) {
         return s.queue_read(id);
     });
-    mocktcp_lib.def("queue_write", [](mtcp_wrapper &s, uint32_t id, std::string buffer) {
-        return s.queue_write(id, (uint8_t *)buffer.data(), buffer.size());
-    }, py::keep_alive<1, 3>());
+    mocktcp_lib.def("queue_write", [](mtcp_wrapper &s, uint32_t id, const std::string& buffer) {
+        uint8_t *mem = (uint8_t *)malloc(buffer.size());
+        memcpy(mem, buffer.data(), buffer.size());
+        return s.queue_write(id, mem, buffer.size());
+    });
     
     mocktcp_lib.def("wait_events", [](mtcp_wrapper &s, std::vector<int> wait_ids) {
         auto ur = s.wait_event_one(wait_ids);
+        if(!ur)
+            throw std::runtime_error(std::string(Format("%s : wait_event_one timed out / interrupted", __PRETTY_FUNCTION__).buf));
+
         auto r = ur->r;
         auto eid = mtcp_req_get_wait_id(r);
         req_type_t req = mtcp_req_get_req_type(r);
@@ -177,9 +184,9 @@ PYBIND11_MODULE(mocktcp_lib, m) {
         if(req == REQ_TYPE_READ)
             return py::make_tuple(eid, mtcp_req_get_id(r), std::string("read"), py::bytes(std::string((const char *)mtcp_req_get_buffer(r), mtcp_req_get_size(r))));
         else if(req == REQ_TYPE_WRITE && mtcp_req_has_error(r))
-            return py::make_tuple(eid, mtcp_req_get_id(r), std::string("werror"), mtcp_req_get_error_info(r), mtcp_req_get_req_size(r));
+            return py::make_tuple(eid, mtcp_req_get_id(r), std::string("werror"), py::make_tuple(mtcp_req_get_error_info(r), mtcp_req_get_req_size(r)));
         else
-            return py::make_tuple(eid, mtcp_req_get_id(r), std::string("write"));
+            return py::make_tuple(eid, mtcp_req_get_id(r), std::string("write"), py::none());
     });
 }
 

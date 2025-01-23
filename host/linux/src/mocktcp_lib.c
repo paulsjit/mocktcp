@@ -8,6 +8,7 @@
 #include <sys/timerfd.h>
 #include <semaphore.h>
 #include <time.h>
+#include <sys/ioctl.h>
 #include "linux_klist.h"
 #include "mtcp_shared.h"
 #include "mocktcp_lib.h"
@@ -261,18 +262,54 @@ FILE *debug_file = NULL;
             list_empty(&user_requests_list) ? "empty" : "full"); \
 } while(0)
 
+static void hexdump(uint8_t *ptr, uint8_t *mark, int lcount, int tot, const char *lead) {
+    for(int i = 0; i < tot; i+=lcount) {
+        fprintf(stderr, "%s[%8d] ", lead, i);
+        for(int j = i; j < i + lcount; j++)
+            if(j < tot)
+                fprintf(stderr, "%02x%s ", ptr[j], (mark && (&ptr[j] == mark)) ? "*" : " ");
+            else
+                fprintf(stderr, "    ");
+        fprintf(stderr, "\t");
+        for(int j = i; j < (i + lcount); j++) {
+            if(j >= tot)
+                break;
+            fprintf(stderr, "%c", isprint(ptr[j]) ? ptr[j] : '.');
+        }
+        fprintf(stderr, "\n");
+    }
+}
+
 #if defined(CONFIG_MTCP_ENABLE_SYNC)
+#define LIMIT (1024 * 1024)
+uint8_t origin[LIMIT];
+
+void flush_by_reading(int fd) {
+    int bytes_available = 0;
+    int ionread_ret = ioctl(fd, FIONREAD, &bytes_available);
+    if(ionread_ret < 0 || bytes_available > sizeof(origin)) {
+        fprintf(stderr, "flush_by_reading error: ionread_ret = %d, bytes_available = %d / %d\n", ionread_ret, bytes_available, sizeof(origin));
+        exit(1);
+    }
+    int l = read(rfd, origin, bytes_available);
+    debug_mtcp("flushed by reading %d bytes, reported available %d bytes\n", l, bytes_available);
+}
+
 void wait_for_sync() {
-    uint8_t origin[512];
     uint8_t *next_byte = &origin[0];
     uint8_t *sendsearch = "DEVBCASTSEND", *acksearch = "DEVBCASTACKD";
     uint8_t *searchpos = &sendsearch[0], *searchinitpos = &sendsearch[0];
     int iter = 0;
+    int tot_recvd = 0;
     bool send_recv = false;
     bool byte_searching = true;
-    int offset, woffset, remaining, wremaining;
+    int woffset, remaining, wremaining;
+    uint8_t *seq_pt;
     uint8_t send_recv_buffer[16] = "DEVBCASTRECV\0\0\0";
 #define SEQPOSITION (12) 
+
+    // We could have done a tcflush, but we are not necessarily a serial 
+    flush_by_reading(rfd);
 
     debug_mtcp("waiting for synchronization, looking for \"%s\" (terminated by 4-byte sequence)\n", sendsearch);
     while(true) {
@@ -293,12 +330,38 @@ void wait_for_sync() {
         FD_ZERO(&rfds);
         FD_ZERO(&wfds);
         maxfd = RSET_AND_MAXFD(rfd);
+        maxfd = RSET_AND_MAXFD(tfd);
         if(send_recv)
             maxfd = WSET_AND_MAXFD(wfd);
 #undef RSET_AND_MAXFD
 #undef WSET_AND_MAXFD
+#define rounded_next_byte(b) (((b + 1) < &origin[LIMIT]) ? (b + 1) : &origin[0] + ((b + 1) - &origin[LIMIT]))
+#define rounded_prev_byte(b) (((b - 1) >= &origin[0]) ? (b - 1) : &origin[LIMIT] - (&origin[0] - b))
+#define rounded_uint32_ending_at(b) ({ \
+    uint8_t mem[4]; \
+    uint8_t *ptr; \
+    int count; \
+    for(ptr = b, count = 3; count >= 0; count--, ptr=rounded_prev_byte(ptr)) \
+        mem[count] = *ptr; \
+    *((uint32_t *)mem); \
+})
+
         retval = select(maxfd + 1, &rfds, &wfds, NULL, NULL);
-        if (send_recv && retval > 0 && FD_ISSET(wfd, &wfds)) {
+        if(FD_ISSET(tfd, &rfds)) {
+            uint64_t eval;
+            read(tfd, &eval, sizeof(eval));
+            fprintf(stderr, "waiting in synchronization, debugging info:\n");
+            fprintf(stderr, "\t&origin[0] = %p, sendsearch = %p, acksearch = %p\n", &origin[0], sendsearch, acksearch);
+            fprintf(stderr, "\tnext_byte = %p, nextbyte @offset = %d, tot_recvd = %d, iter = %d\n", next_byte, next_byte - &origin[0], tot_recvd, iter);
+            fprintf(stderr, "\tseq_pt = %p, seq_pt @offset = %d\n", seq_pt, seq_pt - &origin[0]);
+            fprintf(stderr, "\tsearchpos = %p, searchinitpos = %p, searchinitpos is %s\n", searchpos, searchinitpos, (searchinitpos == sendsearch) ? "sendsearch" : ((searchinitpos == acksearch) ? "acksearch" : "UNKNOWN"));
+            fprintf(stderr, "\tsend_recv = %s, byte_searching = %s\n", send_recv ? "true" : "false", byte_searching ? "true" : "false");
+            fprintf(stderr, "\twoffset = %d, wremaining = %d, remaining = %d\n", woffset, wremaining, remaining);
+            fprintf(stderr, "\torigin\n\t======\n");
+            hexdump(origin, rounded_prev_byte(next_byte), 16, ((tot_recvd > LIMIT) ? LIMIT : tot_recvd), "\t");
+            fprintf(stderr, "\tsend_recv_buffer\n\t================\n");
+            hexdump(send_recv_buffer, NULL, 16, 16, "\t");
+        } else if (send_recv && retval > 0 && FD_ISSET(wfd, &wfds)) {
             int l = write(wfd, &send_recv_buffer[woffset], wremaining);
             woffset += l;
             wremaining -= l;
@@ -306,47 +369,45 @@ void wait_for_sync() {
                 send_recv = false;
             }
         } else if (retval > 0 && FD_ISSET(rfd, &rfds)) {
+            int bytes_available = 0;
+            int ionread_ret = ioctl(rfd, FIONREAD, &bytes_available);
+            read(rfd, next_byte, 1);
+            debug_mtcp("recieved %8d@%p : %02x (%3u) %c (IONREAD: ret = %d, available = %d bytes)\n", iter++, next_byte, *next_byte, *next_byte, isprint(*next_byte) ? *next_byte : '.', ionread_ret, bytes_available);
             if(byte_searching) {
-                read(rfd, next_byte, 1);
-                debug_mtcp("recieved %8d : %02x (%3u) %c \n", iter++, *next_byte, *next_byte, isprint(*next_byte) ? *next_byte : '.');
                 if(*next_byte == *searchpos) {
                     searchpos++;
-                    next_byte++;
                     if(!*searchpos) {
                         debug_mtcp("exit byte searching mode\n");
                         byte_searching = false;
                         remaining = 4;
-                        offset = 0;
                     }
                 } else {
                     searchpos = searchinitpos;
-                    next_byte = &origin[0];
                 }
             } else if(remaining) {
-                int l = read(rfd, &next_byte[offset], remaining);
-                offset += l;
-                remaining -= l;
+                remaining--;
                 if(!remaining) {
-                    uint32_t seq = *((uint32_t *)next_byte);
+                    uint32_t seq = rounded_uint32_ending_at(next_byte);
                     debug_mtcp("sequence %08x\n", seq);
                     debug_mtcp("waiting for acknowledgement, looking for \"%s\" (terminated by 4-byte sequence)\n", acksearch);
                     if(searchinitpos == &sendsearch[0]) {
-                        iter = 0;
+                        seq_pt = next_byte;
                         byte_searching = true;
                         searchinitpos = &acksearch[0];
                         searchpos = searchinitpos;
-                        next_byte = &origin[0];
                         send_recv = true;
                         *((uint32_t *)&send_recv_buffer[SEQPOSITION]) = 0xdead0000 | seq;
                         woffset = 0;
                         wremaining = 16;
                     }
                     else {
-                        debug_mtcp("synchronized, send sequence %08x, recv sequence %08x\n", seq, *((uint32_t *)next_byte));
+                        debug_mtcp("synchronized, send sequence %08x, recv sequence %08x\n", seq, rounded_uint32_ending_at(next_byte));
                         break;
                     }
                 }
             }
+            next_byte = rounded_next_byte(next_byte);
+            tot_recvd++;
         }
     }
 
