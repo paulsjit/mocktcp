@@ -9,6 +9,7 @@
 #include <semaphore.h>
 #include <time.h>
 #include <sys/ioctl.h>
+#include <ctype.h>
 #include "linux_klist.h"
 #include "mtcp_shared.h"
 #include "mocktcp_lib.h"
