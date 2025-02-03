@@ -21,11 +21,25 @@ typedef enum {
     THS_FREE_NEXT
 } tsh_state_t;
 
+typedef enum {
+    RIGID,
+    FLEXIBLE
+} rxflex_t;
 
 typedef struct {
     uint32_t id;
     uint8_t *dataptr;
-    uint32_t sz;
+    rxflex_t flex_type; 
+    union {
+        struct {
+            uint32_t sz;
+        } rig;
+        struct {
+            uint32_t recvsz;
+            uint32_t maxsz;
+            uint32_t *retsz;
+        } flex;
+    } flexinfo;
     callback_t callback;
     void *cbarg;
     struct list_head link;
@@ -277,10 +291,10 @@ arch_define_isr_may_schedule_bh(mtcp_rx_handler) {
             rx_mheader_t *h = (rx_mheader_t *)current_rx_header->skey;
             if(looks_suspicious(h))
                 arch_BUG(); // without accept??
-            else if(h->req->sz != current_rx_header->sz)
+            else if(h->req->flexinfo.rig.sz != current_rx_header->sz)
                 arch_BUG(); // sneaky? we agreed on something else
             rstate = RS_DATA;
-            arch_backend_start_data_recv_isr(h->req->dataptr, h->req->sz);
+            arch_backend_start_data_recv_isr(h->req->dataptr, h->req->flexinfo.rig.sz);
             rx_mheader_free(current_rx_header);
             current_rx_header = &h->header;
             return arch_isr_schedule_bh_false;
@@ -322,17 +336,19 @@ static void match_and_install_ack_nak_header_us(void) {
     list_for_each_entry_safe(rh, tmprh, &rx_usawaiting_list, link) {
         if(req = find_first_in_rx_pending_requests_list(rh->header.id)) {
             list_del(&rh->link);
-            if(rh->header.sz == req->sz) {
+            if((req->flex_type == RIGID && rh->header.sz == req->flexinfo.rig.sz) || (req->flex_type == FLEXIBLE && rh->header.sz <= req->flexinfo.flex.maxsz)) {
                 list_del(&req->link);
                 // rh becomes dangling, revived by WRITE
                 // TODO: put it in a list, and if the user does never
                 // come back, kill it
                 // THINK ABOUT IT
                 rh->req = req;
+                if(req->flex_type == FLEXIBLE)
+                    req->flexinfo.flex.recvsz = rh->header.sz;
                 *install_new_tx_header(NULL, THS_FREE_NEXT) = (info_t){rh->header.id, WRITE_RESP_ACK, 0, (uint32_t)rh};
                 break;
             } else {
-                *install_new_tx_header(NULL, THS_FREE_NEXT) = (info_t){rh->header.id, WRITE_RESP_NAK, req->sz, 0};
+                *install_new_tx_header(NULL, THS_FREE_NEXT) = (info_t){rh->header.id, WRITE_RESP_NAK, req->flex_type == RIGID ? req->flexinfo.rig.sz : req->flexinfo.flex.maxsz, 0};
                 rx_mheader_free_with_lock(&rh->header);
                 break;
             }
@@ -393,6 +409,8 @@ static void mtcp_process(void) {
     list_for_each_entry_safe(rh, tmprh, &rx_done_list, link) {
         list_del(&rh->link);
         arch_restore_interrupts(istate);
+        if(rh->req->flex_type == FLEXIBLE && rh->req->flexinfo.flex.retsz)
+            *rh->req->flexinfo.flex.retsz = rh->req->flexinfo.flex.recvsz;
         rh->req->callback(rh->req->cbarg);
         rx_req_free(rh->req);
         rx_mheader_free_with_lock(&rh->header);
@@ -435,16 +453,9 @@ void mtcp_queue_send(uint32_t id, uint8_t *data, uint32_t sz, callback_t cb, voi
             push_to_pending_tx_queue(&th->header);
     }
 }
-void mtcp_queue_recv(uint32_t id, uint8_t *data, uint32_t sz, callback_t cb, void *arg) {
-    rx_req_t *req = get_a_new_rx_request();
-    {
-        req->id = id;
-        req->dataptr = data;
-        req->sz = sz;
-        req->callback = cb;
-        req->cbarg = arg;
-        push_to_pending_rx_requests_queue(req);
-    }
+
+static void mtcp_queue_recv_common_tail(rx_req_t *req) {
+    push_to_pending_rx_requests_queue(req);
 
     uint32_t istate = arch_disable_interrupts();
     {
@@ -457,6 +468,33 @@ void mtcp_queue_recv(uint32_t id, uint8_t *data, uint32_t sz, callback_t cb, voi
     arch_restore_interrupts(istate);
 
     tx_user_force_kick_if_free();
+}
+
+void mtcp_queue_recv(uint32_t id, uint8_t *data, uint32_t sz, callback_t cb, void *arg) {
+    rx_req_t *req = get_a_new_rx_request();
+    {
+        req->id = id;
+        req->dataptr = data;
+        req->flex_type = RIGID;
+        req->flexinfo.rig.sz = sz;
+        req->callback = cb;
+        req->cbarg = arg;
+    }
+    mtcp_queue_recv_common_tail(req);
+}
+
+void mtcp_queue_recv_flex(uint32_t id, uint8_t *data, uint32_t maxsz, uint32_t *recvsz, callback_t cb, void *arg) {
+    rx_req_t *req = get_a_new_rx_request();
+    {
+        req->id = id;
+        req->dataptr = data;
+        req->flex_type = FLEXIBLE;
+        req->flexinfo.flex.maxsz = maxsz;
+        req->flexinfo.flex.retsz = recvsz;
+        req->callback = cb;
+        req->cbarg = arg;
+    }
+    mtcp_queue_recv_common_tail(req);
 }
 
 #if defined(CONFIG_MTCP_LOG)
