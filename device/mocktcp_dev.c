@@ -28,7 +28,9 @@ typedef enum {
 
 typedef struct {
     uint32_t id;
-    uint8_t *dataptr;
+    uint8_t *packet_ptr;
+    uint32_t packet_sz;
+    uint32_t remaining;
     rxflex_t flex_type; 
     union {
         struct {
@@ -47,8 +49,9 @@ typedef struct {
 
 typedef struct {
     uint32_t id;
-    uint8_t *dataptr;
-    uint32_t sz;
+    uint8_t *packet_ptr;
+    uint32_t packet_sz;
+    uint32_t remaining;
     callback_t callback;
     void *cbarg;
     struct list_head link;
@@ -254,8 +257,14 @@ arch_define_isr_may_schedule_bh(mtcp_tx_handler) {
     // tx_free will not be reset in that case
     tx_mheader_t *th = to_tx_mheader(current_tx_header);
     if(th->state == THS_DATA_SEND_NEXT) {
-        th->state = THS_CALLBACK_NEXT;
-        arch_backend_send_isr(th->req->dataptr, th->req->sz);
+        arch_backend_send_isr(th->req->packet_ptr, th->req->packet_sz);
+        if(!th->req->remaining)
+            th->state = THS_CALLBACK_NEXT;
+        else {
+            th->req->packet_ptr += th->req->packet_sz;
+            th->req->packet_sz = (th->req->remaining < arch_backend_tx_limit) ? th->req->remaining : arch_backend_tx_limit - 1;
+            th->req->remaining -= th->req->packet_sz;
+        }
         return arch_isr_schedule_bh_false;
     } else {
         push_to_tx_done_queue(current_tx_header);
@@ -294,7 +303,7 @@ arch_define_isr_may_schedule_bh(mtcp_rx_handler) {
             else if(h->req->flexinfo.rig.sz != current_rx_header->sz)
                 arch_BUG(); // sneaky? we agreed on something else
             rstate = RS_DATA;
-            arch_backend_start_data_recv_isr(h->req->dataptr, h->req->flexinfo.rig.sz);
+            arch_backend_start_data_recv_isr(h->req->packet_ptr, h->req->packet_sz);
             rx_mheader_free(current_rx_header);
             current_rx_header = &h->header;
             return arch_isr_schedule_bh_false;
@@ -302,11 +311,20 @@ arch_define_isr_may_schedule_bh(mtcp_rx_handler) {
             arch_BUG(); // we dont understand you 
         }
     } else if(rstate == RS_DATA) {
-        // data recv done, so start header recv
-        // BH will take care of callback
-        push_to_rx_done_queue(current_rx_header);
-        start_header_receive();
-        return arch_isr_schedule_bh_true;
+        rx_mheader_t *h = to_rx_mheader(current_rx_header);
+        if(!h->req->remaining) {
+            // data recv done, so start header recv
+            // BH will take care of callback
+            push_to_rx_done_queue(current_rx_header);
+            start_header_receive();
+            return arch_isr_schedule_bh_true;
+        } else {
+            h->req->packet_ptr += h->req->packet_sz;
+            h->req->packet_sz = (h->req->remaining < arch_backend_rx_limit) ? h->req->remaining : arch_backend_rx_limit - 1;
+            h->req->remaining -= h->req->packet_sz;
+            arch_backend_start_data_recv_isr(h->req->packet_ptr, h->req->packet_sz);
+            return arch_isr_schedule_bh_false;
+        }
     } else {
         // not gonna happen
         arch_BUG();
@@ -343,8 +361,11 @@ static void match_and_install_ack_nak_header_us(void) {
                 // come back, kill it
                 // THINK ABOUT IT
                 rh->req = req;
-                if(req->flex_type == FLEXIBLE)
+                if(req->flex_type == FLEXIBLE) {
                     req->flexinfo.flex.recvsz = rh->header.sz;
+                    req->packet_sz = (req->flexinfo.flex.recvsz < arch_backend_rx_limit) ? req->flexinfo.flex.recvsz : arch_backend_rx_limit - 1;
+                    req->remaining = (req->flexinfo.flex.recvsz < arch_backend_rx_limit) ? 0 : req->flexinfo.flex.recvsz - req->packet_sz;
+                }
                 *install_new_tx_header(NULL, THS_FREE_NEXT) = (info_t){rh->header.id, WRITE_RESP_ACK, 0, (uint32_t)rh};
                 break;
             } else {
@@ -435,8 +456,9 @@ void mtcp_queue_send(uint32_t id, uint8_t *data, uint32_t sz, callback_t cb, voi
     tx_req_t *req = get_a_new_tx_request();
     {
         req->id = id;
-        req->dataptr = data;
-        req->sz = sz;
+        req->packet_ptr = data;
+        req->packet_sz = (sz < arch_backend_tx_limit) ? sz : arch_backend_tx_limit - 1;
+        req->remaining = (sz < arch_backend_tx_limit) ? 0 : sz - req->packet_sz;
         req->callback = cb;
         req->cbarg = arg;
     }
@@ -474,9 +496,11 @@ void mtcp_queue_recv(uint32_t id, uint8_t *data, uint32_t sz, callback_t cb, voi
     rx_req_t *req = get_a_new_rx_request();
     {
         req->id = id;
-        req->dataptr = data;
+        req->packet_ptr = data;
         req->flex_type = RIGID;
         req->flexinfo.rig.sz = sz;
+        req->packet_sz = (sz < arch_backend_rx_limit) ? sz : arch_backend_rx_limit - 1;
+        req->remaining = (sz < arch_backend_rx_limit) ? 0 : sz - req->packet_sz;
         req->callback = cb;
         req->cbarg = arg;
     }
@@ -487,7 +511,7 @@ void mtcp_queue_recv_flex(uint32_t id, uint8_t *data, uint32_t maxsz, uint32_t *
     rx_req_t *req = get_a_new_rx_request();
     {
         req->id = id;
-        req->dataptr = data;
+        req->packet_ptr = data;
         req->flex_type = FLEXIBLE;
         req->flexinfo.flex.maxsz = maxsz;
         req->flexinfo.flex.retsz = recvsz;
