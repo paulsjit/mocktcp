@@ -302,6 +302,18 @@ static inline void list_cut_position(struct list_head *list,
 		__list_cut_position(list, head, entry);
 }
 
+static inline void ____list_splice(struct list_head *first,
+				 struct list_head *last,
+				 struct list_head *prev,
+				 struct list_head *next)
+{
+	first->prev = prev;
+	prev->next = first;
+
+	last->next = next;
+	next->prev = last;
+}
+
 static inline void __list_splice(const struct list_head *list,
 				 struct list_head *prev,
 				 struct list_head *next)
@@ -309,11 +321,7 @@ static inline void __list_splice(const struct list_head *list,
 	struct list_head *first = list->next;
 	struct list_head *last = list->prev;
 
-	first->prev = prev;
-	prev->next = first;
-
-	last->next = next;
-	next->prev = last;
+    ____list_splice(first, last, prev, next);
 }
 
 /**

@@ -163,7 +163,6 @@ static LIST_HEAD(tx_pending_list);
     list_add_tail(&to_tx_mheader(x)->link, &tx_pending_list); \
 } while (0)
 
-static LIST_HEAD(rx_usawaiting_list);
 
 // shared
 static LIST_HEAD(rx_header_free_list);
@@ -191,15 +190,19 @@ static LIST_HEAD(tx_done_list);
 #define push_to_tx_done_queue(x) do { \
     list_add_tail(&to_tx_mheader(x)->link, &tx_done_list); \
 } while (0)
+static LIST_HEAD(tx_usdone_list);
 
 static LIST_HEAD(rx_done_list);
 #define push_to_rx_done_queue(x) do { \
     list_add_tail(&to_rx_mheader(x)->link, &rx_done_list); \
 } while (0)
+static LIST_HEAD(rx_usdone_list);
+
 static LIST_HEAD(rx_awaiting_list);
 #define push_to_awaiting_queue(x) do { \
     list_add_tail(&to_rx_mheader(x)->link, &rx_awaiting_list); \
 } while (0)
+static LIST_HEAD(rx_usawaiting_list);
 
 // always set by ISR
 static info_t *current_rx_header = NULL;
@@ -377,67 +380,59 @@ static void match_and_install_ack_nak_header_us(void) {
     }
 }
 
+#define list_reap_first_last(name) do { \
+    if(!list_empty(&CONCAT(name, _list))) { \
+        CONCAT(name, _first) = CONCAT(name, _list).next; \
+        CONCAT(name, _last) = CONCAT(name, _list).prev; \
+        INIT_LIST_HEAD(&CONCAT(name, _list)); \
+        CONCAT(name, _empty) = false; \
+    } \
+} while(0)
 static void mtcp_process(void) {
     tx_mheader_t *th, *tmpth;
     rx_mheader_t *rh, *tmprh;
     uint32_t istate;
 
-    // critical context loop switching
-    // because tx_done_list
+    struct list_head *tx_done_first, *tx_done_last;          bool tx_done_empty = true;
+    struct list_head *rx_done_first, *rx_done_last;          bool rx_done_empty = true;
+    struct list_head *rx_awaiting_first, *rx_awaiting_last;  bool rx_awaiting_empty = true;
+
     istate = arch_disable_interrupts();
-    list_for_each_entry_safe(th, tmpth, &tx_done_list, link) {
+    list_reap_first_last(tx_done);
+    list_reap_first_last(rx_done);
+    list_reap_first_last(rx_awaiting);
+    arch_restore_interrupts(istate);
+
+    if(!tx_done_empty) ____list_splice(tx_done_first, tx_done_last, tx_usdone_list.prev, &tx_usdone_list);
+    if(!rx_done_empty) ____list_splice(rx_done_first, rx_done_last, rx_usdone_list.prev, &rx_usdone_list);
+    if(!rx_awaiting_empty) ____list_splice(rx_awaiting_first, rx_awaiting_last, rx_usawaiting_list.prev, &rx_usawaiting_list);
+
+    list_for_each_entry_safe(th, tmpth, &tx_usdone_list, link) {
         if(th->state == THS_FREE_NEXT) {
             list_del(&th->link);
-            arch_restore_interrupts(istate);
             tx_mheader_free(&th->header);
-            istate = arch_disable_interrupts();
         }
     }
 
-    // while we are at it, get the rx awaiting list into more relaxed rx_usawaiting_list
-    if(!list_empty(&rx_awaiting_list)) {
-        rx_mheader_t *e = list_first_entry(&rx_awaiting_list, rx_mheader_t, link);
-        list_del(&e->link);
-        list_add_tail(&e->link, &rx_usawaiting_list);
-    }
-    arch_restore_interrupts(istate);
-
     tx_user_force_kick_if_free();
-    /* if(tx_free) { */
-    /*     match_and_install_ack_nak_header_us(); */
-    /*     if(current_tx_header) */
-    /*         tx_user_handler_done(current_tx_header, sizeof(*current_tx_header)); */
-    /* } */
 
-    // critical context loop switching
-    // because tx_done_list
-    istate = arch_disable_interrupts();
-    list_for_each_entry_safe(th, tmpth, &tx_done_list, link) {
+    list_for_each_entry_safe(th, tmpth, &tx_usdone_list, link) {
         if(th->state == THS_CALLBACK_NEXT) {
             list_del(&th->link);
-            arch_restore_interrupts(istate);
             th->req->callback(th->req->cbarg);
             tx_req_free(th->req);
             tx_mheader_free(&th->header);
-            istate = arch_disable_interrupts();
         }
     }
-    arch_restore_interrupts(istate);
 
-    // critical context loop switching
-    // because rx_done_list
-    istate = arch_disable_interrupts();
-    list_for_each_entry_safe(rh, tmprh, &rx_done_list, link) {
+    list_for_each_entry_safe(rh, tmprh, &rx_usdone_list, link) {
         list_del(&rh->link);
-        arch_restore_interrupts(istate);
         if(rh->req->flex_type == FLEXIBLE && rh->req->flexinfo.flex.retsz)
             *rh->req->flexinfo.flex.retsz = rh->req->flexinfo.flex.recvsz;
         rh->req->callback(rh->req->cbarg);
         rx_req_free(rh->req);
         rx_mheader_free_with_lock(&rh->header);
-        istate = arch_disable_interrupts();
     }
-    arch_restore_interrupts(istate);
 
 
     if(tx_free) {
@@ -477,17 +472,17 @@ void mtcp_queue_send(uint32_t id, uint8_t *data, uint32_t sz, callback_t cb, voi
 }
 
 static void mtcp_queue_recv_common_tail(rx_req_t *req) {
+    uint32_t istate;
+    struct list_head *rx_awaiting_first, *rx_awaiting_last;
+    bool rx_awaiting_empty = true;
+
     push_to_pending_rx_requests_queue(req);
 
-    uint32_t istate = arch_disable_interrupts();
-    {
-        if(!list_empty(&rx_awaiting_list)) {
-            rx_mheader_t *e = list_first_entry(&rx_awaiting_list, rx_mheader_t, link);
-            list_del(&e->link);
-            list_add_tail(&e->link, &rx_usawaiting_list);
-        }
-    }
+    istate = arch_disable_interrupts();
+    list_reap_first_last(rx_awaiting);
     arch_restore_interrupts(istate);
+
+    if(!rx_awaiting_empty) ____list_splice(rx_awaiting_first, rx_awaiting_last, rx_usawaiting_list.prev, &rx_usawaiting_list);
 
     tx_user_force_kick_if_free();
 }
