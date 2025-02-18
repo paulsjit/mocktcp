@@ -174,6 +174,15 @@ static LIST_HEAD(rx_header_free_list);
     inc_usage(rx_head); \
     CONCAT(rh_, __LINE__); \
 })
+#define get_a_new_rx_header_fast() ({ \
+    if(list_empty(&rx_header_free_list)) \
+        arch_BUG(); \
+    list_first_entry(&rx_header_free_list, rx_mheader_t, link); \
+})
+#define get_a_new_rx_header_fast_tail(rh) ({ \
+    list_del(&(rh)->link); \
+    inc_usage(rx_head); \
+})
 #define rx_mheader_free(x) do { \
     list_add_tail(&to_rx_mheader(x)->link, &rx_header_free_list); \
     dec_usage(rx_head); \
@@ -234,6 +243,14 @@ static rstate_t rstate = RS_HEADER;
     } \
 } while(0)
 
+static inline __attribute__((always_inline)) void start_header_receive_fast(void) {
+    rx_mheader_t *h = get_a_new_rx_header_fast();
+    current_rx_header_partial_recv_info = arch_backend_start_header_recv(&h->header);
+    get_a_new_rx_header_fast_tail(h);
+    current_rx_header = &h->header;
+    rstate = RS_HEADER;
+}
+
 static void start_header_receive(void) {
     rx_mheader_t *h = get_a_new_rx_header();
     current_rx_header = &h->header;
@@ -278,6 +295,8 @@ arch_define_isr_may_schedule_bh(mtcp_tx_handler) {
 }
 
 arch_define_isr_may_schedule_bh(mtcp_rx_handler) {
+    current_rx_header = __builtin_assume_aligned (current_rx_header, 4);
+
     if(rstate == RS_HEADER) {
         switch(arch_backend_finalize_partial_recv(current_rx_header, current_rx_header_partial_recv_info)) {
         case PARTIAL_CONTINUE:
@@ -290,11 +309,13 @@ arch_define_isr_may_schedule_bh(mtcp_rx_handler) {
         default:
             arch_BUG();
         }
+
         if(current_rx_header->type == WRITE_REQ) {
             // if its a write req, push it to BH
             // BH will schedule ACK / NAK
-            push_to_awaiting_queue(current_rx_header);
-            start_header_receive();
+            info_t *prev_header = current_rx_header;
+            start_header_receive_fast();
+            push_to_awaiting_queue(prev_header);
             return arch_isr_schedule_bh_true;
         } else if(current_rx_header->type == WRITE) {
             // if its a write, immediately start the recv 
@@ -305,10 +326,11 @@ arch_define_isr_may_schedule_bh(mtcp_rx_handler) {
                 arch_BUG(); // without accept??
             else if(h->req->flexinfo.rig.sz != current_rx_header->sz)
                 arch_BUG(); // sneaky? we agreed on something else
-            rstate = RS_DATA;
+            info_t *prev_header = current_rx_header;
             arch_backend_start_data_recv_isr(h->req->packet_ptr, h->req->packet_sz);
-            rx_mheader_free(current_rx_header);
             current_rx_header = &h->header;
+            rstate = RS_DATA;
+            rx_mheader_free(prev_header);
             return arch_isr_schedule_bh_false;
         } else {
             arch_BUG(); // we dont understand you 
@@ -318,14 +340,17 @@ arch_define_isr_may_schedule_bh(mtcp_rx_handler) {
         if(!h->req->remaining) {
             // data recv done, so start header recv
             // BH will take care of callback
-            push_to_rx_done_queue(current_rx_header);
-            start_header_receive();
+            info_t *prev_header = current_rx_header;
+            start_header_receive_fast();
+            push_to_rx_done_queue(prev_header);
             return arch_isr_schedule_bh_true;
         } else {
-            h->req->packet_ptr += h->req->packet_sz;
-            h->req->packet_sz = (h->req->remaining < arch_backend_rx_limit) ? h->req->remaining : arch_backend_rx_limit - 1;
-            h->req->remaining -= h->req->packet_sz;
-            arch_backend_start_data_recv_isr(h->req->packet_ptr, h->req->packet_sz);
+            uint32_t cpacket_sz  = (h->req->remaining < arch_backend_rx_limit) ? h->req->remaining : arch_backend_rx_limit - 1;
+            uint8_t *cpacket_ptr = h->req->packet_ptr + h->req->packet_sz;
+            arch_backend_start_data_recv_isr(cpacket_ptr, cpacket_sz);
+            h->req->packet_ptr = cpacket_ptr;
+            h->req->packet_sz = cpacket_sz;
+            h->req->remaining -= cpacket_sz;
             return arch_isr_schedule_bh_false;
         }
     } else {
@@ -557,48 +582,32 @@ uint32_t recv_send_seq;
 bool need_ack_send = false;
 bool ack_send_done = false;
 volatile bool synchronised = false;
-volatile uint32_t rpos, spos;
+uint8_t *next_rptr, *next_sptr, *end_rptr;
 uint8_t dev_bcast_send[16] __attribute__((aligned(4))) = "DEVBCASTSEND\0\0\0";
 uint8_t dev_bcast_ack[16] __attribute__((aligned(4))) =  "DEVBCASTACKD\0\0\0";
 uint8_t dev_bcast_recv[16] __attribute__((aligned(4))) = "DEVBCASTRECV\0\0\0";
 uint8_t rdata[16];
 #define SEQPOSITION (12)
 
-arch_define_isr_may_schedule_bh(sync_tx_isr) {
-    if(ack_send_done) {
-        synchronised = true;
-        return false;
-    } else if(need_ack_send) {
-        *((uint32_t *)&dev_bcast_ack[SEQPOSITION]) = recv_send_seq;
-        arch_backend_send((uint8_t *)dev_bcast_ack, sizeof(dev_bcast_ack));
-        ack_send_done = true;
-        return false;
-    }
-    *((uint32_t *)&dev_bcast_send[SEQPOSITION]) = next_send_seq();
-    arch_backend_send((uint8_t *)dev_bcast_send, sizeof(dev_bcast_send));
-    return false;
+arch_define_isr_no_bh(sync_tx_isr) {
+    tx_free = true;
 }
 
-arch_define_isr_may_schedule_bh(sync_rx_isr) {
-    if(spos >= SEQPOSITION) {
-        spos++;
-        rpos++;
-        if(spos == sizeof(dev_bcast_recv)) {
-            recv_send_seq = *((uint32_t *)&rdata[SEQPOSITION]);
-            need_ack_send = true;
-        } else
-            arch_backend_start_data_recv(&rdata[rpos], 1);
-        return false;
+arch_define_isr_no_bh(sync_rx_isr) {
+    if(next_rptr > end_rptr) {
+        recv_send_seq = *((uint32_t *)&rdata[SEQPOSITION]);
+        need_ack_send = true;
+    } else if (next_rptr == end_rptr) {
+        arch_backend_start_data_recv(next_rptr, 4);
+        next_rptr += 4;
+    } else if(next_rptr[-1] == next_sptr[0]) {
+        arch_backend_start_data_recv(next_rptr, 1);
+        next_rptr++;
+        next_sptr++;
     } else {
-        if(rdata[rpos] == dev_bcast_recv[spos]) {
-            rpos++;
-            spos++;
-        } else {
-            rpos = 0;
-            spos = 0;
-        }
-        arch_backend_start_data_recv(&rdata[rpos], 1);
-        return false;
+        arch_backend_start_data_recv(&rdata[0], 1);
+        next_rptr = &rdata[1];
+        next_sptr = &dev_bcast_recv[0];
     }
 }
 
@@ -608,16 +617,32 @@ static void start_broadcast_send(void) {
 }
 
 static void start_devbcastrecv_search(void) {
-    rpos = 0; spos = 0;
-    arch_backend_start_data_recv(&rdata[rpos], 1);
+    next_rptr = &rdata[1];
+    next_sptr = &dev_bcast_recv[0];
+    end_rptr = &rdata[SEQPOSITION];
+    arch_backend_start_data_recv(&rdata[0], 1);
 }
 
 static void synchronize_with_lib(void) {
     arch_register_isr(arch_backend_tx_intr, sync_tx_isr);
     arch_register_isr(arch_backend_rx_intr, sync_rx_isr);
     start_devbcastrecv_search();
-    start_broadcast_send();
-    while(synchronised == false);
+    while(!synchronised) {
+        if(tx_free) {
+            if(need_ack_send) {
+                if(ack_send_done) {
+                    synchronised = true;
+                } else {
+                    *((uint32_t *)&dev_bcast_ack[SEQPOSITION]) = recv_send_seq;
+                    arch_backend_send((uint8_t *)dev_bcast_ack, sizeof(dev_bcast_ack)); tx_free = false;
+                    ack_send_done = true;
+                }
+            } else {
+                *((uint32_t *)&dev_bcast_send[SEQPOSITION]) = next_send_seq();
+                arch_backend_send((uint8_t *)dev_bcast_send, sizeof(dev_bcast_send)); tx_free = false;
+            }
+        }
+    }
     arch_deregister_isr(arch_backend_tx_intr);
     arch_deregister_isr(arch_backend_rx_intr);
 }
