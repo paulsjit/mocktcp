@@ -652,11 +652,6 @@ arch_define_isr_no_bh(sync_rx_isr) {
     }
 }
 
-static void start_broadcast_send(void) {
-    *((uint32_t *)&dev_bcast_send[SEQPOSITION]) = next_send_seq();
-    arch_backend_send((uint8_t *)dev_bcast_send, sizeof(dev_bcast_send));
-}
-
 static void start_devbcastrecv_search(void) {
     next_rptr = &rdata[1];
     next_sptr = &dev_bcast_recv[0];
