@@ -670,11 +670,13 @@ static void synchronize_with_lib(void) {
                     synchronised = true;
                 } else {
                     *((uint32_t *)&dev_bcast_ack[SEQPOSITION]) = recv_send_seq;
+                    arch_mem_barrier();
                     arch_backend_send((uint8_t *)dev_bcast_ack, sizeof(dev_bcast_ack)); tx_free = false;
                     ack_send_done = true;
                 }
             } else {
                 *((uint32_t *)&dev_bcast_send[SEQPOSITION]) = next_send_seq();
+                arch_mem_barrier();
                 arch_backend_send((uint8_t *)dev_bcast_send, sizeof(dev_bcast_send)); tx_free = false;
             }
         }
