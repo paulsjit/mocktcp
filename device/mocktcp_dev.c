@@ -23,7 +23,8 @@ typedef enum {
 
 typedef enum {
     RIGID,
-    FLEXIBLE
+    FLEXIBLE,
+    NOTIFY
 } rxflex_t;
 
 typedef struct {
@@ -369,6 +370,15 @@ static rx_req_t *find_first_in_rx_pending_requests_list(uint32_t id) {
             return r;
     return NULL;
 }
+
+static rx_mheader_t *match_in_rx_usdone_list(rx_req_t *req) {
+    rx_mheader_t *rh;
+    list_for_each_entry(rh, &rx_usdone_list, link)
+        if(rh->req == req)
+            return rh;
+    return NULL;
+}
+
 static void match_and_install_ack_nak_header_us(void) {
     rx_mheader_t *rh, *tmprh;
     rx_req_t *req;
@@ -382,7 +392,17 @@ static void match_and_install_ack_nak_header_us(void) {
     list_for_each_entry_safe(rh, tmprh, &rx_usawaiting_list, link) {
         if(req = find_first_in_rx_pending_requests_list(rh->header.id)) {
             list_del(&rh->link);
-            if((req->flex_type == RIGID && rh->header.sz == req->flexinfo.rig.sz) || (req->flex_type == FLEXIBLE && rh->header.sz <= req->flexinfo.flex.maxsz)) {
+            if(req->flex_type == NOTIFY) {
+                if(!rh->header.sz) {
+                    list_del(&req->link);
+                    rh->req = req;
+                    list_add_tail(&rx_usdone_list, &rh->link);
+                } else {
+                    *install_new_tx_header(NULL, THS_FREE_NEXT) = (info_t){rh->header.id, WRITE_RESP_NAK, 0, 0};
+                    rx_mheader_free_with_lock(&rh->header);
+                    break;
+                }
+            } else if((req->flex_type == RIGID && rh->header.sz == req->flexinfo.rig.sz) || (req->flex_type == FLEXIBLE && rh->header.sz <= req->flexinfo.flex.maxsz)) {
                 list_del(&req->link);
                 // rh becomes dangling, revived by WRITE
                 // TODO: put it in a list, and if the user does never
@@ -510,6 +530,16 @@ static void mtcp_queue_recv_common_tail(rx_req_t *req) {
     if(!rx_awaiting_empty) ____list_splice(rx_awaiting_first, rx_awaiting_last, rx_usawaiting_list.prev, &rx_usawaiting_list);
 
     tx_user_force_kick_if_free();
+
+    if(req->flex_type == NOTIFY) {
+        rx_mheader_t *rh = match_in_rx_usdone_list(req);
+        if(rh) {
+            list_del(&rh->link);
+            rh->req->callback(rh->req->cbarg);
+            rx_req_free(rh->req);
+            rx_mheader_free_with_lock(&rh->header);
+        }
+    }
 }
 
 void mtcp_queue_recv(uint32_t id, uint8_t *data, uint32_t sz, callback_t cb, void *arg) {
@@ -535,6 +565,17 @@ void mtcp_queue_recv_flex(uint32_t id, uint8_t *data, uint32_t maxsz, uint32_t *
         req->flex_type = FLEXIBLE;
         req->flexinfo.flex.maxsz = maxsz;
         req->flexinfo.flex.retsz = recvsz;
+        req->callback = cb;
+        req->cbarg = arg;
+    }
+    mtcp_queue_recv_common_tail(req);
+}
+
+void mtcp_queue_recv_notify(uint32_t id, callback_t cb, void *arg) {
+    rx_req_t *req = get_a_new_rx_request();
+    {
+        req->id = id;
+        req->flex_type = NOTIFY;
         req->callback = cb;
         req->cbarg = arg;
     }

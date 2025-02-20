@@ -585,6 +585,8 @@ static wstate_t write_from_contwrite(void) {
 static wstate_t write_header_execute(void *arg) {
     write_pending_t *r = arg;
     Sheader_debug(&r->header);
+    if(!r->req->sz)
+        return write_data_execute(r);
     r->header = (info_t){r->req->id, WRITE, r->req->sz};
     r->ts = NOW();
     list_add_tail(&r->link, &awaited_writes);

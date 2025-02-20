@@ -12,6 +12,7 @@ typedef void (*callback_t)(void *arg);
 void mtcp_queue_send(uint32_t id, uint8_t *data, uint32_t sz, callback_t cb, void *arg);
 void mtcp_queue_recv(uint32_t id, uint8_t *data, uint32_t sz, callback_t cb, void *arg);
 void mtcp_queue_recv_flex(uint32_t id, uint8_t *data, uint32_t maxsz, uint32_t *recvsz, callback_t cb, void *arg);
+void mtcp_queue_recv_notify(uint32_t id, callback_t cb, void *arg);
 
 #if defined(CONFIG_MTCP_LOG)
 void mtcp_log(const char *fmt, ...);
