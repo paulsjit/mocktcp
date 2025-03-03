@@ -318,6 +318,7 @@ void wait_for_sync() {
         fd_set wfds;
         int retval;
         int maxfd = 0;
+        uint32_t seq;
 
 #define RSET_AND_MAXFD(v) ({ \
     FD_SET((v), &rfds); \
@@ -388,16 +389,17 @@ void wait_for_sync() {
             } else if(remaining) {
                 remaining--;
                 if(!remaining) {
-                    uint32_t seq = rounded_uint32_ending_at(next_byte);
-                    debug_mtcp("sequence %08x\n", seq);
-                    debug_mtcp("waiting for acknowledgement, looking for \"%s\" (terminated by 4-byte sequence)\n", acksearch);
                     if(searchinitpos == &sendsearch[0]) {
+                        seq = rounded_uint32_ending_at(next_byte);
+                        debug_mtcp("sequence %08x\n", seq);
+                        debug_mtcp("waiting for acknowledgement, looking for \"%s\" (terminated by 4-byte sequence)\n", acksearch);
                         seq_pt = next_byte;
                         byte_searching = true;
                         searchinitpos = &acksearch[0];
                         searchpos = searchinitpos;
                         send_recv = true;
-                        *((uint32_t *)&send_recv_buffer[SEQPOSITION]) = 0xdead0000 | seq;
+                        seq = 0xdead0000 | seq;
+                        *((uint32_t *)&send_recv_buffer[SEQPOSITION]) = seq;
                         woffset = 0;
                         wremaining = 16;
                     }
