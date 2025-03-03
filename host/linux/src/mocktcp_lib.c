@@ -759,7 +759,7 @@ req_t *mtcp_submit_request(uint32_t id, req_type_t type, uint8_t *b, uint32_t sz
     r->error = false;
 
     pthread_mutex_lock(&ulock);
-    list_add(&r->link, &user_requests_list);
+    list_add_tail(&r->link, &user_requests_list);
     pthread_mutex_unlock(&ulock);
 
     write(efd, &notify, sizeof(notify));
